@@ -150,8 +150,8 @@ class Bridge:
             try:
                 data = await asyncio.to_thread(provider_request, '/v1/click_to_call', self.settings.smartflo_token, payload=payload)
                 result = {k: data.get(k) for k in ('success', 'ref_id')}
-                result['accepted_only'] = True
-                entry.update(status=202, result=result)
+                result['accepted_only'] = data.get('success') is True
+                entry.update(status=202 if result['accepted_only'] else 400, result=result)
             except Exception:
                 entry.update(status=502, result={'error': 'Call result unknown; check Smartflo before attempting another call'})
             return response(entry['status'], entry['result'])

@@ -6,7 +6,7 @@
   },
   "servers": [
     {
-      "url": "https://REPLACE_WITH_RENDER_HOST"
+      "url": "https://ohmsakthi-smartflo-integration.onrender.com"
     }
   ],
   "security": [
