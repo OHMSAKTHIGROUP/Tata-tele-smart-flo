@@ -80,15 +80,18 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.opened, 0)
 
     async def test_bidirectional_audio_framing_and_interruption(self):
+        self.settings.instructions = 'தமிழில் ஆனந்தா இன் AI உதவியாளராகப் பேசவும்.'
         socket = await self.client.ws_connect('/voice/stream', headers={'Authorization':'Bearer ' + STREAM})
         await socket.send_json({'event':'connected'})
         await socket.send_json({'event':'start','start':{'streamSid':'test','mediaFormat':{'encoding':'audio/x-mulaw','sampleRate':8000}}})
         config = await asyncio.wait_for(self.ai.sent.get(), 2)
         self.assertEqual(config['session']['audio']['input']['format']['type'], 'audio/pcmu')
+        self.assertEqual(config['session']['instructions'], self.settings.instructions)
         audio = base64.b64encode(b'\xff' * 800).decode()
         await socket.send_json({'event':'media','streamSid':'test','media':{'payload':audio}})
         await self.ai.incoming.put({'type':'session.updated'})
-        self.assertEqual((await asyncio.wait_for(self.ai.sent.get(), 2))['type'],'response.create')
+        greeting = await asyncio.wait_for(self.ai.sent.get(), 2)
+        self.assertEqual(greeting, {'type': 'response.create'})
         self.assertEqual((await asyncio.wait_for(self.ai.sent.get(), 2))['audio'],audio)
         await self.ai.incoming.put({'type':'response.output_audio.delta','item_id':'item1','delta':base64.b64encode(b'x' * 161).decode()})
         media = await asyncio.wait_for(socket.receive_json(), 2)

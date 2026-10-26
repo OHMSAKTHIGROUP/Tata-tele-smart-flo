@@ -290,9 +290,9 @@ class Bridge:
                     kind = event.get('type')
                     if kind == 'session.updated' and not state['ready']:
                         state['ready'] = True
-                        await ai.send(json.dumps({'type': 'response.create', 'response': {
-                            'instructions': 'Greet the caller as the OHMSAKTHI GROUP AI test assistant and ask how you can help.',
-                        }}))
+                        # Keep the configured company, language and AI disclosure in force
+                        # for the greeting as well as the rest of the conversation.
+                        await ai.send(json.dumps({'type': 'response.create'}))
                         for pending in state['pending']:
                             await ai.send(pending)
                         state['pending'].clear()
