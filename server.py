@@ -3,9 +3,11 @@ import asyncio
 import base64
 import hmac
 import json
+import logging
 import os
 import re
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -16,6 +18,7 @@ from websockets.asyncio.client import connect
 SMARTFLO = 'https://api-smartflo.tatateleservices.com'
 PHONE = re.compile(r'^\+?[0-9]{10,15}$')
 DATE = re.compile(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$')
+VOICE_LOG = logging.getLogger('smartflo.voice')
 BASE_INSTRUCTIONS = (
     'You are the OHMSAKTHI GROUP AI test receptionist. Identify yourself as an AI assistant. '
     'Speak clearly and briefly in English or Tamil, following the caller. '
@@ -84,16 +87,33 @@ class Bridge:
         self.active = 0
         self.connector = connector or connect
         self.call_requests = {}  # Single-process retry protection, expires after one hour.
+        self.voice_counts = {}
+        self.last_voice_event = None
+
+    def voice_event(self, event, trace=None, error_type=None):
+        # Only application-defined stages and exception class names. Never log
+        # provider messages, headers, caller metadata, audio or transcripts.
+        self.voice_counts[event] = self.voice_counts.get(event, 0) + 1
+        entry = {'event': event}
+        if trace:
+            entry.update(trace_id=trace['id'], stage=trace['stage'])
+        if error_type:
+            entry['error_type'] = error_type
+        self.last_voice_event = entry
+        VOICE_LOG.info('%s', json.dumps(entry))
 
     async def process_request(self, request):
         path = request.path
         if path == '/voice/stream':
             if not authorized(request.headers, self.settings.stream_key):
+                self.voice_event('stream_auth_rejected')
                 return response(401, {'error': 'Unauthorized'})
             if not self.settings.openai_key:
+                self.voice_event('voice_credentials_missing')
                 return response(503, {'error': 'Voice credentials are not configured'})
             # Capacity is checked again synchronously at handler entry.
             if self.active >= self.settings.max_connections:
+                self.voice_event('stream_capacity_rejected')
                 return response(503, {'error': 'Call capacity reached'})
             raw = web.WebSocketResponse(max_msg_size=65536, heartbeat=20)
             await raw.prepare(request)
@@ -116,6 +136,8 @@ class Bridge:
                 'active_calls': self.active,
                 'number_assignments_configured': False,
                 'outbound_calls_enabled': self.settings.outbound_enabled,
+                'voice_diagnostics': {'counts': dict(self.voice_counts),
+                                      'last_event': self.last_voice_event},
             })
         if path == '/api/calls' and request.method == 'POST':
             if not self.settings.outbound_enabled or not self.settings.smartflo_token:
@@ -195,18 +217,23 @@ class Bridge:
             await socket.close(1013, 'Call capacity reached')
             return
         self.active += 1
+        trace = {'id': uuid.uuid4().hex, 'stage': 'awaiting_start'}
+        self.voice_event('stream_connected', trace)
         try:
             async with asyncio.timeout(self.settings.max_seconds):
-                await self._call(socket)
+                await self._call(socket, trace)
         except TimeoutError:
+            self.voice_event('stream_timeout', trace)
             await socket.close(1000, 'Test call time limit reached')
-        except Exception:
+        except Exception as exc:
             # Do not include exception text: provider failures may contain credential URLs.
+            self.voice_event('stream_error', trace, type(exc).__name__)
             await socket.close(1011, 'Voice connection ended')
         finally:
+            self.voice_event('stream_closed', trace)
             self.active -= 1
 
-    async def _call(self, socket):
+    async def _call(self, socket, trace):
         # OpenAI is contacted only after Smartflo sends a valid start message.
         async with asyncio.timeout(10):
             async for raw in socket:
@@ -215,6 +242,7 @@ class Bridge:
                     start = message.get('start', {})
                     break
                 if message.get('event') != 'connected':
+                    self.voice_event('invalid_start_event', trace)
                     await socket.close(1008, 'Expected stream start')
                     return
             else:
@@ -222,12 +250,17 @@ class Bridge:
         stream = start.get('streamSid')
         fmt = start.get('mediaFormat', {})
         if not isinstance(stream, str) or not stream or fmt.get('encoding') != 'audio/x-mulaw' or fmt.get('sampleRate') != 8000:
+            self.voice_event('invalid_media_format', trace)
             await socket.close(1008, 'Expected Smartflo mulaw 8000 Hz stream')
             return
+        trace['stage'] = 'connecting_openai'
+        self.voice_event('start_validated', trace)
         url = 'wss://api.openai.com/v1/realtime?model=' + urllib.parse.quote(self.settings.model, safe='')
         async with self.connector(url, additional_headers={
             'Authorization': 'Bearer ' + self.settings.openai_key,
         }, max_size=1048576, open_timeout=15) as ai:
+            trace['stage'] = 'awaiting_ai_session'
+            self.voice_event('openai_connected', trace)
             await ai.send(json.dumps({'type': 'session.update', 'session': {
                 'type': 'realtime', 'instructions': self.settings.instructions,
                 'output_modalities': ['audio'],
@@ -240,7 +273,7 @@ class Bridge:
             }}))
             state = {'ready': False, 'pending': [], 'pending_bytes': 0,
                      'tail': b'', 'chunk': 0, 'item': None, 'sent': 0,
-                     'played': 0, 'marks': {}, 'mark_counter': 0}
+                     'played': 0, 'marks': {}, 'mark_counter': 0, 'audio_started': False}
 
             async def send_audio(data, final=False):
                 state['tail'] += data
@@ -249,6 +282,10 @@ class Bridge:
                     state['tail'] += b'\xff' * (160 - len(state['tail']) % 160)
                     size = len(state['tail'])
                 if size:
+                    if not state['audio_started']:
+                        state['audio_started'] = True
+                        trace['stage'] = 'streaming_audio'
+                        self.voice_event('first_ai_audio', trace)
                     payload, state['tail'] = state['tail'][:size], state['tail'][size:]
                     state['chunk'] += 1
                     state['sent'] += size
@@ -263,6 +300,7 @@ class Bridge:
                 async for raw in socket:
                     m = json.loads(raw)
                     if m.get('event') == 'stop':
+                        self.voice_event('smartflo_stop_received', trace)
                         return
                     if m.get('streamSid') not in (None, stream):
                         raise ValueError('Mismatched stream')
@@ -289,6 +327,8 @@ class Bridge:
                     event = json.loads(raw)
                     kind = event.get('type')
                     if kind == 'session.updated' and not state['ready']:
+                        trace['stage'] = 'awaiting_ai_audio'
+                        self.voice_event('ai_session_ready', trace)
                         state['ready'] = True
                         # Keep the configured company, language and AI disclosure in force
                         # for the greeting as well as the rest of the conversation.
@@ -310,7 +350,11 @@ class Bridge:
                                 'audio_end_ms': state['played']}))
                         state.update(item=None, sent=0, played=0, marks={}, tail=b'')
                     elif kind == 'error':
+                        self.voice_event('openai_error', trace)
                         raise RuntimeError('Realtime provider error')
+                    elif kind == 'response.done' and event.get('response', {}).get('status') == 'failed':
+                        self.voice_event('openai_response_failed', trace)
+                        raise RuntimeError('Realtime response failed')
 
             tasks = [asyncio.create_task(receive_caller()), asyncio.create_task(receive_ai())]
             try:
@@ -353,4 +397,5 @@ def create_app(settings=None, connector=None):
 
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format='%(message)s')
     web.run_app(create_app(), host='0.0.0.0', port=int(os.getenv('PORT', '10000')), access_log=None)

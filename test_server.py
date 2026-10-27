@@ -72,6 +72,24 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(WSServerHandshakeError):
             await self.client.ws_connect('/voice/stream', headers={'Authorization':'Bearer wrong'})
         self.assertEqual(self.opened, 0)
+        result = await self.client.get('/api/status', headers={'Authorization':'Bearer ' + ADMIN})
+        self.assertEqual((await result.json())['voice_diagnostics']['counts']['stream_auth_rejected'], 1)
+
+    async def test_provider_failure_diagnostics_do_not_expose_secrets(self):
+        socket = await self.client.ws_connect('/voice/stream', headers={'Authorization':'Bearer ' + STREAM})
+        with self.assertLogs('smartflo.voice', level='INFO') as logs:
+            await socket.send_json({'event':'start','start':{'streamSid':'private-caller-id','mediaFormat':{'encoding':'audio/x-mulaw','sampleRate':8000}}})
+            await asyncio.wait_for(self.ai.sent.get(), 2)
+            await self.ai.incoming.put({'type':'error','error':{'message':'secret-token-and-private-transcript'}})
+            await asyncio.wait_for(socket.receive(), 2)
+        result = await self.client.get('/api/status', headers={'Authorization':'Bearer ' + ADMIN})
+        diagnostics = (await result.json())['voice_diagnostics']
+        self.assertEqual(diagnostics['counts']['openai_error'], 1)
+        self.assertEqual(diagnostics['counts']['stream_error'], 1)
+        self.assertEqual(diagnostics['last_event']['stage'], 'awaiting_ai_session')
+        output = json.dumps(diagnostics) + str(logs.output)
+        for secret in ('secret-token-and-private-transcript', 'private-caller-id', ADMIN, STREAM):
+            self.assertNotIn(secret, output)
 
     async def test_invalid_audio_format_does_not_contact_openai(self):
         socket = await self.client.ws_connect('/voice/stream', headers={'Authorization':'Bearer ' + STREAM})
