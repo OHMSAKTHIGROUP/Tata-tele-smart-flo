@@ -60,6 +60,17 @@ class OutboundTests(unittest.TestCase):
         self.assertEqual(len(self.posts), 1)
         self.assertNotIn('private credentials', json.dumps(result))
 
+    def test_ten_minute_call_limit_and_invalid_limits(self):
+        for invalid in (0, 601, True, '600'):
+            with self.assertRaises(ValueError):
+                initiate('9999999999', 'ApprovedTestRequest123', self.temp.name,
+                         self.secrets, True, self.transport, call_timeout=invalid)
+        result = initiate('9999999999', 'ApprovedTestRequest123', self.temp.name,
+                          self.secrets, True, self.transport, call_timeout=600)
+        self.assertEqual(result['state'], 'accepted')
+        self.assertEqual(self.posts[0][2]['call_timeout'], 600)
+        self.assertEqual(self.posts[0][2]['customer_ring_timeout'], 30)
+
     def test_busy_bridge_and_missing_authorization_do_not_dial(self):
         with self.assertRaises(ValueError):
             self.call(confirmed=False)
