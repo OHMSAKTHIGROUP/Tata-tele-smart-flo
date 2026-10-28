@@ -50,9 +50,11 @@ def request_json(url, token, payload=None):
         return json.load(result)
 
 
-def initiate(number, request_id, ledger_dir, secrets, confirmed=False, transport=request_json):
+def initiate(number, request_id, ledger_dir, secrets, confirmed=False, transport=request_json, call_timeout=180):
     if confirmed is not True:
         raise ValueError('Specific recipient and call purpose must be authorized first')
+    if type(call_timeout) is not int or not 10 <= call_timeout <= 600:
+        raise ValueError('Call timeout must be 10-600 seconds')
     number = customer_number(number)
     if not re.fullmatch(r'[A-Za-z0-9]{16,80}', request_id):
         raise ValueError('Request ID must contain 16-80 letters or digits')
@@ -68,6 +70,7 @@ def initiate(number, request_id, ledger_dir, secrets, confirmed=False, transport
     if status.get('active_calls') != 0:
         return {'state': 'voice_busy_or_unknown', 'dialed': False}
     state = {'state': 'request_pending', 'request_id': request_id,
+             'customer_ring_timeout': 30, 'call_timeout': call_timeout,
              'recipient_hash': hashlib.sha256(number.encode()).hexdigest(),
              'success': None, 'ref_id': None, 'verified_outcome': 'not_verified'}
     try:
@@ -85,7 +88,7 @@ def initiate(number, request_id, ledger_dir, secrets, confirmed=False, transport
         payload = {'customer_number': number,
                    'api_key': secrets['SMARTFLO_SUPPORT_API_KEY'],
                    'caller_id': CALLER_ID, 'async': 1,
-                   'customer_ring_timeout': 30, 'call_timeout': 180,
+                   'customer_ring_timeout': 30, 'call_timeout': call_timeout,
                    'custom_identifier': {'testid': request_id}}
         try:
             result = transport(PROVIDER, secrets['SMARTFLO_API_TOKEN'], payload)
@@ -105,12 +108,13 @@ def main():
     parser.add_argument('--number', required=True)
     parser.add_argument('--request-id', required=True)
     parser.add_argument('--ledger-dir', required=True)
+    parser.add_argument('--call-timeout', type=int, default=180)
     parser.add_argument('--credentials', default=str(Path(__file__).with_name('.env.local')))
     parser.add_argument('--confirmed', action='store_true', help='Use only after explicit call authorization')
     args = parser.parse_args()
     try:
         result = initiate(args.number, args.request_id, args.ledger_dir,
-                          credentials(args.credentials), args.confirmed)
+                          credentials(args.credentials), args.confirmed, call_timeout=args.call_timeout)
     except Exception as error:
         # A failure persisting the final ledger may occur AFTER the POST.
         # Never infer that no call was made from a generic exception.
