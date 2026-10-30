@@ -5,6 +5,7 @@ import base64
 import json
 import urllib.parse
 import urllib.request
+import urllib.error
 
 AGENT_API = 'https://api.elevenlabs.io/v1/convai/conversation/get-signed-url'
 
@@ -12,8 +13,20 @@ AGENT_API = 'https://api.elevenlabs.io/v1/convai/conversation/get-signed-url'
 def signed_url(key, agent_id):
     request = urllib.request.Request(AGENT_API + '?' + urllib.parse.urlencode({'agent_id': agent_id}),
                                     headers={'xi-api-key': key, 'Accept': 'application/json'})
-    with urllib.request.urlopen(request, timeout=15) as result:
-        url = json.load(result)['signed_url']
+    try:
+        with urllib.request.urlopen(request, timeout=15) as result:
+            url = json.load(result)['signed_url']
+    except urllib.error.HTTPError as exc:
+        # Expose only HTTP status and an allowlisted classification, never body text.
+        reason = 'provider_rejection'
+        try:
+            status = json.loads(exc.read(65536)).get('detail', {}).get('status')
+            if status in {'missing_permissions', 'invalid_api_key', 'quota_exceeded',
+                          'insufficient_credits', 'agent_not_found', 'not_found', 'invalid_authorization_header'}:
+                reason = status
+        except (ValueError, AttributeError, TypeError):
+            pass
+        raise type('ElevenHTTP' + str(exc.code) + '_' + reason, (RuntimeError,), {})() from None
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != 'wss' or parsed.hostname != 'api.elevenlabs.io' or parsed.port not in (None, 443):
         raise ValueError('Unexpected voice endpoint')
