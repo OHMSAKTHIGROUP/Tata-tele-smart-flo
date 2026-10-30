@@ -14,6 +14,7 @@ import urllib.request
 from dataclasses import dataclass
 from aiohttp import web, WSMsgType
 from websockets.asyncio.client import connect
+import eleven_bridge
 
 SMARTFLO = 'https://api-smartflo.tatateleservices.com'
 PHONE = re.compile(r'^\+?[0-9]{10,15}$')
@@ -41,6 +42,9 @@ class Settings:
     max_seconds: int = 300
     max_connections: int = 2
     instructions: str = BASE_INSTRUCTIONS
+    voice_provider: str = 'openai'
+    elevenlabs_key: str = ''
+    elevenlabs_agent: str = ''
 
     @classmethod
     def from_env(cls):
@@ -55,6 +59,9 @@ class Settings:
             max_seconds=max(10, min(900, int(os.getenv('MAX_CALL_SECONDS', '300')))),
             max_connections=max(1, min(10, int(os.getenv('MAX_CONCURRENT_CALLS', '2')))),
             instructions=os.getenv('ASSISTANT_INSTRUCTIONS', BASE_INSTRUCTIONS),
+            voice_provider=os.getenv('VOICE_PROVIDER', 'openai'),
+            elevenlabs_key=os.getenv('ELEVENLABS_API_KEY', ''),
+            elevenlabs_agent=os.getenv('ELEVENLABS_AGENT_ID', ''),
         )
 
 
@@ -108,7 +115,10 @@ class Bridge:
             if not authorized(request.headers, self.settings.stream_key):
                 self.voice_event('stream_auth_rejected')
                 return response(401, {'error': 'Unauthorized'})
-            if not self.settings.openai_key:
+            credentials_ready = (bool(self.settings.elevenlabs_key and self.settings.elevenlabs_agent)
+                                 if self.settings.voice_provider == 'elevenlabs' else
+                                 bool(self.settings.openai_key) if self.settings.voice_provider == 'openai' else False)
+            if not credentials_ready:
                 self.voice_event('voice_credentials_missing')
                 return response(503, {'error': 'Voice credentials are not configured'})
             # Capacity is checked again synchronously at handler entry.
@@ -131,6 +141,8 @@ class Bridge:
         if path == '/api/status':
             return response(200, {
                 'openai_configured': bool(self.settings.openai_key),
+                'voice_provider': self.settings.voice_provider,
+                'elevenlabs_configured': bool(self.settings.elevenlabs_key and self.settings.elevenlabs_agent),
                 'smartflo_configured': bool(self.settings.smartflo_token),
                 'voice_auth_configured': len(self.settings.stream_key) >= 32,
                 'active_calls': self.active,
@@ -255,6 +267,14 @@ class Bridge:
             return
         trace['stage'] = 'connecting_openai'
         self.voice_event('start_validated', trace)
+        if self.settings.voice_provider == 'elevenlabs':
+            trace['stage'] = 'connecting_elevenlabs'
+            def event(name):
+                trace['stage'] = name
+                self.voice_event(name, trace)
+            await eleven_bridge.run(socket, stream, self.settings.elevenlabs_key,
+                                    self.settings.elevenlabs_agent, self.connector, event)
+            return
         url = 'wss://api.openai.com/v1/realtime?model=' + urllib.parse.quote(self.settings.model, safe='')
         async with self.connector(url, additional_headers={
             'Authorization': 'Bearer ' + self.settings.openai_key,
@@ -393,6 +413,24 @@ def create_app(settings=None, connector=None):
     bridge = Bridge(settings or Settings.from_env(), connector)
     app = web.Application(client_max_size=65536)
     app.router.add_route('*', '/{path:.*}', bridge.process_request)
+    async def startup_probe(application):
+        # Explicit, time-bounded deployment test; no ongoing scheduled generation.
+        if (bridge.settings.voice_provider == 'elevenlabs' and
+                time.time() < float(os.getenv('ELEVENLABS_PROBE_UNTIL', '0'))):
+            async def check():
+                try:
+                    passed = await eleven_bridge.probe(bridge.settings, bridge.connector)
+                    bridge.voice_event('elevenlabs_probe_passed' if passed else 'elevenlabs_probe_no_audio')
+                except Exception as exc:
+                    bridge.voice_event('elevenlabs_probe_failed', error_type=type(exc).__name__)
+            application['elevenlabs_probe_task'] = asyncio.create_task(check())
+    async def cleanup_probe(application):
+        task = application.get('elevenlabs_probe_task')
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    app.on_startup.append(startup_probe)
+    app.on_cleanup.append(cleanup_probe)
     return app
 
 
