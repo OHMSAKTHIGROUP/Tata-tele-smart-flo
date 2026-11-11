@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from aiohttp import web, WSMsgType
 from websockets.asyncio.client import connect
 import eleven_bridge
+import gemini_bridge
 
 SMARTFLO = 'https://api-smartflo.tatateleservices.com'
 PHONE = re.compile(r'^\+?[0-9]{10,15}$')
@@ -45,6 +46,16 @@ class Settings:
     voice_provider: str = 'openai'
     elevenlabs_key: str = ''
     elevenlabs_agent: str = ''
+    gemini_key: str = ''
+    gemini_model: str = ''
+    gemini_voice: str = 'Aoede'
+
+    def voice_ready(self):
+        if self.voice_provider == 'gemini':
+            return gemini_bridge.configured(self.gemini_key, self.gemini_model)
+        if self.voice_provider == 'elevenlabs':
+            return bool(self.elevenlabs_key and self.elevenlabs_agent)
+        return self.voice_provider == 'openai' and bool(self.openai_key)
 
     @classmethod
     def from_env(cls):
@@ -59,9 +70,12 @@ class Settings:
             max_seconds=max(10, min(900, int(os.getenv('MAX_CALL_SECONDS', '300')))),
             max_connections=max(1, min(10, int(os.getenv('MAX_CONCURRENT_CALLS', '2')))),
             instructions=os.getenv('ASSISTANT_INSTRUCTIONS', BASE_INSTRUCTIONS),
-            voice_provider=os.getenv('VOICE_PROVIDER', 'openai'),
+            voice_provider=os.getenv('VOICE_PROVIDER', 'openai').strip().lower(),
             elevenlabs_key=os.getenv('ELEVENLABS_API_KEY', ''),
             elevenlabs_agent=os.getenv('ELEVENLABS_AGENT_ID', ''),
+            gemini_key=os.getenv('GEMINI_API_KEY', ''),
+            gemini_model=os.getenv('GEMINI_LIVE_MODEL', ''),
+            gemini_voice=os.getenv('GEMINI_VOICE', 'Aoede'),
         )
 
 
@@ -115,10 +129,7 @@ class Bridge:
             if not authorized(request.headers, self.settings.stream_key):
                 self.voice_event('stream_auth_rejected')
                 return response(401, {'error': 'Unauthorized'})
-            credentials_ready = (bool(self.settings.elevenlabs_key and self.settings.elevenlabs_agent)
-                                 if self.settings.voice_provider == 'elevenlabs' else
-                                 bool(self.settings.openai_key) if self.settings.voice_provider == 'openai' else False)
-            if not credentials_ready:
+            if not self.settings.voice_ready():
                 self.voice_event('voice_credentials_missing')
                 return response(503, {'error': 'Voice credentials are not configured'})
             # Capacity is checked again synchronously at handler entry.
@@ -142,6 +153,8 @@ class Bridge:
             return response(200, {
                 'openai_configured': bool(self.settings.openai_key),
                 'voice_provider': self.settings.voice_provider,
+                'voice_configured': self.settings.voice_ready(),
+                'gemini_configured': gemini_bridge.configured(self.settings.gemini_key, self.settings.gemini_model),
                 'elevenlabs_configured': bool(self.settings.elevenlabs_key and self.settings.elevenlabs_agent),
                 'smartflo_configured': bool(self.settings.smartflo_token),
                 'voice_auth_configured': len(self.settings.stream_key) >= 32,
@@ -267,6 +280,15 @@ class Bridge:
             return
         trace['stage'] = 'connecting_openai'
         self.voice_event('start_validated', trace)
+        if self.settings.voice_provider == 'gemini':
+            trace['stage'] = 'connecting_gemini'
+            def gemini_event(name):
+                trace['stage'] = name
+                self.voice_event(name, trace)
+            await gemini_bridge.run(socket, stream, self.settings.gemini_key,
+                                    self.settings.gemini_model, self.settings.gemini_voice,
+                                    self.settings.instructions, gemini_event)
+            return
         if self.settings.voice_provider == 'elevenlabs':
             trace['stage'] = 'connecting_elevenlabs'
             def event(name):
@@ -275,6 +297,8 @@ class Bridge:
             await eleven_bridge.run(socket, stream, self.settings.elevenlabs_key,
                                     self.settings.elevenlabs_agent, self.connector, event)
             return
+        if self.settings.voice_provider != 'openai':
+            raise ValueError('Unsupported voice provider')
         url = 'wss://api.openai.com/v1/realtime?model=' + urllib.parse.quote(self.settings.model, safe='')
         async with self.connector(url, additional_headers={
             'Authorization': 'Bearer ' + self.settings.openai_key,

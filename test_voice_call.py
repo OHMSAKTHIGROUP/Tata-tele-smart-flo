@@ -79,6 +79,22 @@ class OutboundTests(unittest.TestCase):
         self.assertEqual(self.posts, [])
         self.assertEqual(list(Path(self.temp.name).glob('*.json')), [])
 
+    def test_gemini_readiness_does_not_require_openai_key(self):
+        def transport(url, token, payload=None):
+            if payload is None:
+                return dict(active_calls=0, openai_configured=False,
+                            voice_provider='gemini', gemini_configured=True,
+                            voice_configured=True, voice_auth_configured=True)
+            return self.transport(url, token, payload)
+        self.assertEqual(self.call(transport)['state'], 'accepted')
+
+    def test_unconfigured_gemini_does_not_dial_even_with_openai_key(self):
+        result = self.call(lambda *args: dict(active_calls=0, openai_configured=True,
+            voice_provider='gemini', gemini_configured=False, voice_configured=False,
+            voice_auth_configured=True))
+        self.assertEqual(result['state'], 'voice_not_ready')
+        self.assertEqual(self.posts, [])
+
 
 if __name__ == '__main__':
     unittest.main()

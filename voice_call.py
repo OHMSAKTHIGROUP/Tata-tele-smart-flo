@@ -64,7 +64,12 @@ def initiate(number, request_id, ledger_dir, secrets, confirmed=False, transport
     if ledger.exists():
         return {'state': 'existing_request', 'redialed': False}
     status = transport(BASE + '/api/status', secrets['ADMIN_API_KEY'])
-    if not status.get('openai_configured') or not status.get('voice_auth_configured'):
+    provider = status.get('voice_provider', 'openai')
+    voice_ready = (status.get('voice_configured') if 'voice_configured' in status else
+                   status.get({'openai': 'openai_configured',
+                               'elevenlabs': 'elevenlabs_configured',
+                               'gemini': 'gemini_configured'}.get(provider, 'unsupported'), False))
+    if not voice_ready or not status.get('voice_auth_configured'):
         return {'state': 'voice_not_ready', 'dialed': False}
     # Require an idle bridge to give this supervised test exclusive capacity.
     if status.get('active_calls') != 0:
